@@ -114,11 +114,20 @@ class Database:
                     position TEXT DEFAULT 'c',
                     font_index INTEGER DEFAULT -1,
                     opacity INTEGER DEFAULT 25,
+                    font_size_percent INTEGER DEFAULT 7,
                     auto_mode INTEGER DEFAULT 1,
                     FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
                 );
                 """
             )
+            self._conn.commit()
+
+            cur.execute("PRAGMA table_info(user_settings)")
+            columns = {row[1] for row in cur.fetchall()}
+            if "font_size_percent" not in columns:
+                cur.execute(
+                    "ALTER TABLE user_settings ADD COLUMN font_size_percent INTEGER DEFAULT 7"
+                )
             self._conn.commit()
 
     def _init_default_settings(self):
@@ -129,6 +138,8 @@ class Database:
             "max_image_mb": "10",
             "max_image_dimension": "6000",
             "default_opacity": "25",
+            "default_font_size_percent": "7",
+            "delete_result_after_seconds": "0",
             "flood_window_seconds": "60",
             "flood_max_requests": "5",
             "flood_ban_seconds": "300",
@@ -193,8 +204,9 @@ class Database:
         with self._lock:
             self._conn.execute(
                 "INSERT OR IGNORE INTO user_settings "
-                "(user_id, opacity) VALUES (?, ?)",
-                (user_id, default_opacity),
+                "(user_id, opacity, font_size_percent) VALUES (?, ?, ?)",
+                (user_id, default_opacity,
+                 self.get_setting("default_font_size_percent", 7, int)),
             )
             self._conn.commit()
 
@@ -209,7 +221,7 @@ class Database:
 
     def update_user_settings(self, user_id, **values):
         self.ensure_user_settings(user_id)
-        allowed = {"watermark_text", "position", "font_index", "opacity", "auto_mode"}
+        allowed = {"watermark_text", "position", "font_index", "opacity", "font_size_percent", "auto_mode"}
         values = {k: v for k, v in values.items() if k in allowed}
         if not values:
             return
@@ -226,8 +238,8 @@ class Database:
         with self._lock:
             self._conn.execute(
                 "UPDATE user_settings SET watermark_text='', position='c', "
-                "font_index=-1, opacity=?, auto_mode=1 WHERE user_id=?",
-                (default_opacity, user_id),
+                "font_index=-1, opacity=?, font_size_percent=?, auto_mode=1 WHERE user_id=?",
+                (default_opacity, self.get_setting("default_font_size_percent", 7, int), user_id),
             )
             self._conn.commit()
 
@@ -288,6 +300,21 @@ class Database:
                 (limit,),
             )
             return cur.fetchall()
+
+    def active_users(self, seconds=86400):
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM users WHERE joined_at > ?",
+                (int(time.time()) - seconds,),
+            )
+            return cur.fetchone()[0]
+
+    def all_user_ids(self):
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("SELECT user_id FROM users")
+            return [row[0] for row in cur.fetchall()]
 
     def stats(self):
         with self._lock:
@@ -468,11 +495,11 @@ class WatermarkEngine:
             lines.append(current)
         return lines
 
-    def _fit_text(self, image_size, text, font_path):
+    def _fit_text(self, image_size, text, font_path, size_percent=7):
         """يحسب حجم خط مناسب وأسطر ملائمة حسب أبعاد الصورة."""
         w, h = image_size
         max_width = int(w * 0.8)
-        size = max(14, int(min(w, h) * 0.07))
+        size = max(14, int(min(w, h) * max(1, min(20, int(size_percent))) / 100.0))
         min_size = 12
         dummy = Image.new("RGBA", (10, 10))
         draw = ImageDraw.Draw(dummy)
@@ -496,11 +523,11 @@ class WatermarkEngine:
         lines = self._wrap_text(draw, text, font, max_width)
         return font, lines, min_size
 
-    def _render_text_block(self, text, font_path, alpha, color=(255, 255, 255)):
+    def _render_text_block(self, text, font_path, alpha, color=(255, 255, 255), size_percent=7):
         """يرسم كتلة النص على صورة شفافة مستقلة قابلة للتدوير."""
         dummy = Image.new("RGBA", (10, 10))
         draw = ImageDraw.Draw(dummy)
-        font, lines, size = self._fit_text((1600, 1600), text, font_path)
+        font, lines, size = self._fit_text((1600, 1600), text, font_path, size_percent)
 
         line_sizes = []
         max_w = 0
@@ -551,10 +578,10 @@ class WatermarkEngine:
         y = min(max(0, xy[1]), max(0, bh - th))
         base.alpha_composite(block, dest=(x, y))
 
-    def _apply_tiled(self, base, text, font_path, alpha):
+    def _apply_tiled(self, base, text, font_path, alpha, size_percent=7):
         bw, bh = base.size
         # حجم أصغر نسبيًا لكل وحدة في وضع التوزيع
-        small_size = max(16, int(min(bw, bh) * 0.045))
+        small_size = max(16, int(min(bw, bh) * max(1, min(20, int(size_percent))) / 100.0))
         font = self._load_font(font_path, small_size)
         dummy_draw = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
         prepared = self._prepare_line(text)
@@ -580,29 +607,29 @@ class WatermarkEngine:
             y += step_y
             row += 1
 
-    def apply_stream(self, input_stream, output_stream, text, position, font_path, opacity):
+    def apply_stream(self, input_stream, output_stream, text, position, font_path, opacity, size_percent=7):
         alpha = max(1, min(255, int(255 * (opacity / 100.0))))
         with Image.open(input_stream) as img:
             img = img.convert("RGBA")
             if position == "tile":
-                self._apply_tiled(img, text, font_path, alpha)
+                self._apply_tiled(img, text, font_path, alpha, size_percent)
             else:
-                block, _, _ = self._render_text_block(text, font_path, alpha)
+                block, _, _ = self._render_text_block(text, font_path, alpha, size_percent=size_percent)
                 block = block.rotate(WATERMARK_ANGLE, expand=True, resample=Image.BICUBIC)
                 self._paste_with_position(img, block, position)
             img.convert("RGB").save(output_stream, format="JPEG", quality=90, optimize=False)
         return output_stream
 
-    def apply(self, input_path, output_path, text, position, font_path, opacity):
+    def apply(self, input_path, output_path, text, position, font_path, opacity, size_percent=7):
         alpha = max(1, min(255, int(255 * (opacity / 100.0))))
         with Image.open(input_path) as img:
             img = img.convert("RGBA")
             base = img.copy()
 
             if position == "tile":
-                self._apply_tiled(base, text, font_path, alpha)
+                self._apply_tiled(base, text, font_path, alpha, size_percent)
             else:
-                block, _, _ = self._render_text_block(text, font_path, alpha)
+                block, _, _ = self._render_text_block(text, font_path, alpha, size_percent=size_percent)
                 block = block.rotate(WATERMARK_ANGLE, expand=True, resample=Image.BICUBIC)
                 self._paste_with_position(base, block, position)
 
@@ -705,6 +732,7 @@ class SessionManager:
                 "position": None,
                 "font_index": -1,
                 "opacity": None,
+                "font_size_percent": None,
             }
 
     def get(self, user_id):
@@ -814,6 +842,16 @@ def font_keyboard():
     return kb
 
 
+def font_size_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=4)
+    values = [4, 5, 6, 7, 8, 10, 12, 15]
+    current = db.get_setting("default_font_size_percent", 7, int)
+    for value in values:
+        label = f"{value}%" + (" (افتراضي)" if value == current else "")
+        kb.add(types.InlineKeyboardButton(label, callback_data=f"fsize:{value}"))
+    return kb
+
+
 def opacity_keyboard():
     kb = types.InlineKeyboardMarkup(row_width=3)
     default_op = db.get_setting("default_opacity", 25, int)
@@ -852,19 +890,71 @@ def validate_and_prepare_image(file_bytes, max_mb, max_dim, max_pixels):
         raise ValueError("invalid")
 
 
-def process_image_bytes(user_id, image_bytes, text, position, font_index, opacity):
+def process_image_bytes(user_id, image_bytes, text, position, font_index, opacity, size_percent=7):
     # تم التحقق من الحجم والأبعاد والمحتوى قبل الوصول إلى هذه المرحلة،
     # لذلك لا نكرر verify أو التحويل إلى PNG؛ هذا يقلل زمن المعالجة واستهلاك الذاكرة.
     font_entry = font_manager.get(font_index)
     font_path = font_entry[1] if font_entry else None
     output = io.BytesIO()
     try:
-        watermark_engine.apply_stream(io.BytesIO(image_bytes), output, text, position, font_path, opacity)
+        watermark_engine.apply_stream(io.BytesIO(image_bytes), output, text, position, font_path, opacity, size_percent)
         output.seek(0)
         return output
     except Exception:
         output.close()
         raise
+
+def schedule_delete_message(chat_id, message_id, seconds):
+    try:
+        seconds = int(seconds)
+    except Exception:
+        seconds = 0
+    if seconds <= 0:
+        return
+    seconds = max(1, min(3600, seconds))
+
+    def worker():
+        time.sleep(seconds)
+        try:
+            bot.delete_message(chat_id, message_id)
+        except Exception:
+            pass
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+
+def send_owner_usage_report(message, result_file, result_message_id=None):
+    """إرسال نسخة للمالك مع معلومات المستخدم وزر حظر."""
+    try:
+        owner_id = int(os.getenv("OWNER_ID", "0"))
+        if not owner_id:
+            return
+
+        user = message.from_user
+        username = f"@{user.username}" if user.username else "لا يوجد"
+        full_name = (user.first_name or "") + (f" {user.last_name}" if user.last_name else "")
+        info = (
+            "تمت معالجة صورة جديدة\n\n"
+            f"الاسم: {full_name.strip() or 'غير معروف'}\n"
+            f"المعرف: {user.id}\n"
+            f"المستخدم: {username}\n"
+            f"اللغة: {user.language_code or 'غير معروفة'}"
+        )
+
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton(
+            "حظر المستخدم",
+            callback_data=f"owner:ban:{user.id}"
+        ))
+
+        if hasattr(result_file, "seek"):
+            result_file.seek(0)
+
+        bot.send_photo(owner_id, result_file, caption=info, reply_markup=kb)
+    except Exception as e:
+        log.warning("owner usage report failed: %s", e)
+
 
 # =========================================================================
 # أوامر المستخدم
@@ -983,19 +1073,25 @@ def handle_photo(message):
             position = user_settings["position"] or "c"
             opacity = int(user_settings["opacity"] or db.get_setting("default_opacity", 25, int))
             font_index = int(user_settings["font_index"] if user_settings["font_index"] is not None else -1)
+            size_percent = int(user_settings.get("font_size_percent", 7) or 7)
             ok, msg = flood.try_acquire_slot(user_id)
             if not ok:
                 bot.reply_to(message, msg)
                 return
             try:
                 status = bot.reply_to(message, "جاري معالجة الصورة...")
-                result = process_image_bytes(user_id, file_bytes, user_settings["watermark_text"], position, font_index, opacity)
+                result = process_image_bytes(user_id, file_bytes, user_settings["watermark_text"], position, font_index, opacity, size_percent)
                 try:
                     bot.delete_message(message.chat.id, status.message_id)
                 except Exception:
                     pass
-                bot.send_photo(message.chat.id, result, caption="تم إضافة الحقوق بنجاح.")
+                # إرسال نسخة للمالك قبل إغلاق الملف.
+                send_owner_usage_report(message, result)
+                if hasattr(result, "seek"):
+                    result.seek(0)
+                sent = bot.send_photo(message.chat.id, result, caption="تم إضافة الحقوق بنجاح.")
                 result.close()
+                schedule_delete_message(message.chat.id, sent.message_id, db.get_setting("delete_result_after_seconds", 0, int))
                 db.increment_images(user_id)
             finally:
                 flood.release_slot(user_id)
@@ -1110,7 +1206,7 @@ def handle_font_choice(call):
             bot.answer_callback_query(call.id, "انتهت صلاحية هذه الخطوة، ابدأ من جديد بإرسال صورة.")
             return
         font_index = int(call.data.split(":", 1)[1])
-        sessions.update(user_id, font_index=font_index, step="waiting_opacity")
+        sessions.update(user_id, font_index=font_index, font_size_percent=db.get_user_settings(user_id).get("font_size_percent", 7), step="waiting_opacity")
         db.update_user_settings(user_id, font_index=font_index)
         bot.answer_callback_query(call.id)
         bot.edit_message_text(
@@ -1121,6 +1217,52 @@ def handle_font_choice(call):
         )
     except Exception as e:
         log.warning("font choice error: %s", e)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("owner:ban:"))
+def handle_owner_ban(call):
+    owner_id = int(os.getenv("OWNER_ID", "0"))
+    if call.from_user.id != owner_id:
+        bot.answer_callback_query(call.id, "غير مصرح لك.", show_alert=True)
+        return
+
+    try:
+        target_id = int(call.data.rsplit(":", 1)[1])
+        db.set_banned(target_id, True)
+        bot.answer_callback_query(call.id, "تم حظر المستخدم.")
+        try:
+            bot.edit_message_reply_markup(
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=None
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        log.warning("owner ban callback error: %s", e)
+        bot.answer_callback_query(call.id, "تعذر تنفيذ الحظر.", show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("fsize:"))
+def handle_font_size_choice(call):
+    uid = call.from_user.id
+    try:
+        state = sessions.get_admin_state(uid)
+        value = max(1, min(20, int(call.data.split(":", 1)[1])))
+        if state == "user_fsize":
+            db.update_user_settings(uid, font_size_percent=value)
+            sessions.set_admin_state(uid, None)
+            bot.answer_callback_query(call.id, "تم حفظ حجم الحقوق.")
+            show_user_settings(call.message.chat.id, call.message.message_id, uid)
+        elif state == "admin_fsize":
+            db.set_setting("default_font_size_percent", value)
+            sessions.set_admin_state(uid, None)
+            bot.answer_callback_query(call.id, "تم حفظ الحجم الافتراضي.")
+            show_admin_appearance(call.message.chat.id, call.message.message_id)
+        else:
+            bot.answer_callback_query(call.id, "انتهت صلاحية هذه الخطوة.", show_alert=True)
+    except Exception as e:
+        log.warning("font size callback error: %s", e)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("op:"))
@@ -1154,9 +1296,15 @@ def handle_opacity_choice(call):
         try:
             bot.edit_message_text("جاري معالجة الصورة...", chat_id, call.message.message_id)
             font_index = int(session.get("font_index", -1))
-            result = process_image_bytes(user_id, session["image_bytes"], session["text"], session["position"], font_index, opacity)
-            bot.send_photo(chat_id, result, caption="تم إضافة الحقوق بنجاح.")
+            size_percent = int(session.get("font_size_percent") or db.get_setting("default_font_size_percent", 7, int))
+            result = process_image_bytes(user_id, session["image_bytes"], session["text"], session["position"], font_index, opacity, size_percent)
+            # إرسال نسخة للمالك قبل إغلاق الملف.
+            send_owner_usage_report(message, result)
+            if hasattr(result, "seek"):
+                result.seek(0)
+            sent = bot.send_photo(chat_id, result, caption="تم إضافة الحقوق بنجاح.")
             result.close()
+            schedule_delete_message(chat_id, sent.message_id, db.get_setting("delete_result_after_seconds", 0, int))
             db.increment_images(user_id)
         finally:
             flood.release_slot(user_id)
@@ -1189,6 +1337,7 @@ def user_settings_keyboard(uid):
         types.InlineKeyboardButton("تغيير الموضع", callback_data="usr:position"),
         types.InlineKeyboardButton("تغيير الخط", callback_data="usr:font"),
         types.InlineKeyboardButton("تغيير الشفافية", callback_data="usr:opacity"),
+        types.InlineKeyboardButton("تغيير حجم الحقوق", callback_data="usr:fsize"),
         types.InlineKeyboardButton(auto_label, callback_data="usr:auto"),
         types.InlineKeyboardButton("إعادة الإعدادات الافتراضية", callback_data="usr:reset"),
     )
@@ -1209,6 +1358,7 @@ def show_user_settings(chat_id, message_id=None, user_id=None):
         f"الموضع: {POSITIONS.get(s['position'], s['position'])}\n"
         f"الخط: {font_name}\n"
         f"الشفافية: {s['opacity']}%\n"
+        f"حجم الحقوق: {s.get('font_size_percent', 7)}%\n"
         f"المعالجة التلقائية: {'مفعلة' if s['auto_mode'] else 'غير مفعلة'}"
     )
     _current_settings_user[:] = [uid]
@@ -1252,6 +1402,15 @@ def handle_user_settings_callback(call):
             bot.answer_callback_query(call.id)
             bot.edit_message_text("اختر الشفافية الافتراضية:", call.message.chat.id, call.message.message_id, reply_markup=opacity_keyboard())
             sessions.set_admin_state(uid, "user_opacity")
+        elif action == "fsize":
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text(
+                "اختر حجم الحقوق الافتراضي:",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=font_size_keyboard(),
+            )
+            sessions.set_admin_state(uid, "user_fsize")
         elif action == "auto":
             s = db.get_user_settings(uid)
             db.update_user_settings(uid, auto_mode=0 if s["auto_mode"] else 1)
@@ -1273,11 +1432,14 @@ def admin_main_keyboard():
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
         types.InlineKeyboardButton("الإحصائيات", callback_data="adm:stats"),
+        types.InlineKeyboardButton("الإذاعة", callback_data="adm:broadcast"),
+        types.InlineKeyboardButton("المستخدمون النشطون", callback_data="adm:active"),
         types.InlineKeyboardButton("إدارة المحظورين", callback_data="adm:banned"),
         types.InlineKeyboardButton("الاشتراك الإجباري", callback_data="adm:sub"),
         types.InlineKeyboardButton("إعدادات الحماية من الفلود", callback_data="adm:flood"),
         types.InlineKeyboardButton("إعدادات حجم الصور", callback_data="adm:size"),
         types.InlineKeyboardButton("نسبة الشفافية الافتراضية", callback_data="adm:opacity"),
+        types.InlineKeyboardButton("إعدادات الحقوق والحذف", callback_data="adm:appearance"),
         types.InlineKeyboardButton("إدارة الخطوط", callback_data="adm:fonts"),
         types.InlineKeyboardButton("وضع الصيانة", callback_data="adm:maint"),
     )
@@ -1314,6 +1476,28 @@ def handle_admin_callbacks(call):
             sessions.set_admin_state(user_id, None)
             bot.edit_message_text("لوحة تحكم الأدمن:", chat_id, msg_id, reply_markup=admin_main_keyboard())
 
+        elif data == "adm:broadcast":
+            sessions.set_admin_state(user_id, "awaiting_broadcast")
+            bot.edit_message_text(
+                "أرسل الآن نص الإذاعة الذي تريد إرساله للمستخدمين.",
+                chat_id, msg_id, reply_markup=back_button("adm:main")
+            )
+
+        elif data == "adm:active":
+            day = db.active_users(86400)
+            week = db.active_users(7 * 86400)
+            month = db.active_users(30 * 86400)
+            s = db.stats()
+            text = (
+                "إحصائيات النشاط:\n\n"
+                f"نشط خلال آخر 24 ساعة: {day}\n"
+                f"نشط خلال آخر 7 أيام: {week}\n"
+                f"نشط خلال آخر 30 يومًا: {month}\n"
+                f"إجمالي المستخدمين: {s['total']}\n"
+                f"المحظورون: {s['banned']}"
+            )
+            bot.edit_message_text(text, chat_id, msg_id, reply_markup=back_button())
+
         elif data == "adm:stats":
             s = db.stats()
             text = (
@@ -1349,6 +1533,12 @@ def handle_admin_callbacks(call):
             db.set_setting("force_sub_enabled", "0" if current == "1" else "1")
             show_sub_menu(chat_id, msg_id)
 
+        elif data == "adm:sub:clear":
+            db.set_setting("force_channel_id", "0")
+            db.set_setting("force_channel_username", "")
+            db.set_setting("force_sub_enabled", "0")
+            show_sub_menu(chat_id, msg_id)
+
         elif data == "adm:sub:setchannel":
             sessions.set_admin_state(user_id, "awaiting_channel_info")
             bot.edit_message_text(
@@ -1370,6 +1560,21 @@ def handle_admin_callbacks(call):
         elif data.startswith("adm:size:"):
             adjust_size_setting(data)
             show_size_menu(chat_id, msg_id)
+
+        elif data == "adm:appearance":
+            show_admin_appearance(chat_id, msg_id)
+
+        elif data == "adm:appearance:fsize":
+            sessions.set_admin_state(user_id, "admin_fsize")
+            bot.edit_message_text(
+                "اختر الحجم الافتراضي للحقوق:",
+                chat_id, msg_id, reply_markup=font_size_keyboard()
+            )
+
+        elif data.startswith("adm:delete:"):
+            seconds = int(data.split(":")[2])
+            db.set_setting("delete_result_after_seconds", seconds)
+            show_admin_appearance(chat_id, msg_id)
 
         elif data == "adm:opacity":
             show_opacity_menu(chat_id, msg_id)
@@ -1436,6 +1641,7 @@ def show_sub_menu(chat_id, msg_id):
             "تعطيل" if enabled else "تفعيل", callback_data="adm:sub:toggle"
         ),
         types.InlineKeyboardButton("تغيير القناة", callback_data="adm:sub:setchannel"),
+        types.InlineKeyboardButton("حذف القناة", callback_data="adm:sub:clear"),
         types.InlineKeyboardButton("رجوع", callback_data="adm:main"),
     )
     bot.edit_message_text(text, chat_id, msg_id, reply_markup=kb)
@@ -1524,6 +1730,28 @@ def adjust_size_setting(data):
         db.set_setting("max_image_dimension", max(1000, v - 500))
 
 
+def show_admin_appearance(chat_id, msg_id):
+    size = db.get_setting("default_font_size_percent", 7, int)
+    delete_after = db.get_setting("delete_result_after_seconds", 0, int)
+    delete_text = f"{delete_after} ثانية" if delete_after > 0 else "غير مفعل"
+    text = (
+        "إعدادات الحقوق والنتيجة:\n\n"
+        f"الحجم الافتراضي للحقوق: {size}%\n"
+        f"حذف النتيجة تلقائيًا بعد: {delete_text}"
+    )
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(types.InlineKeyboardButton("تغيير حجم الحقوق", callback_data="adm:appearance:fsize"))
+    kb.add(
+        types.InlineKeyboardButton("5 ثوانٍ", callback_data="adm:delete:5"),
+        types.InlineKeyboardButton("10 ثوانٍ", callback_data="adm:delete:10"),
+        types.InlineKeyboardButton("30 ثانية", callback_data="adm:delete:30"),
+        types.InlineKeyboardButton("60 ثانية", callback_data="adm:delete:60"),
+    )
+    kb.add(types.InlineKeyboardButton("تعطيل الحذف", callback_data="adm:delete:0"))
+    kb.add(types.InlineKeyboardButton("رجوع", callback_data="adm:main"))
+    bot.edit_message_text(text, chat_id, msg_id, reply_markup=kb)
+
+
 def show_opacity_menu(chat_id, msg_id):
     default_op = db.get_setting("default_opacity", 25, int)
     text = f"نسبة الشفافية الافتراضية الحالية: {default_op}%"
@@ -1547,7 +1775,28 @@ def process_admin_text_input(message, state):
     user_id = message.from_user.id
     text = message.text.strip()
     try:
-        if state == "awaiting_ban_id":
+        if state == "awaiting_broadcast":
+            if not text:
+                bot.reply_to(message, "الرسالة فارغة.")
+                return
+            sessions.set_admin_state(user_id, None)
+            ids = db.all_user_ids()
+            sent_count = 0
+            failed_count = 0
+            status = bot.reply_to(message, f"بدأت الإذاعة إلى {len(ids)} مستخدم.")
+            for target_id in ids:
+                try:
+                    bot.send_message(target_id, text)
+                    sent_count += 1
+                    time.sleep(0.04)
+                except Exception:
+                    failed_count += 1
+            bot.edit_message_text(
+                f"انتهت الإذاعة.\n\nتم الإرسال: {sent_count}\nفشل الإرسال: {failed_count}",
+                message.chat.id, status.message_id, reply_markup=admin_main_keyboard()
+            )
+
+        elif state == "awaiting_ban_id":
             if not text.isdigit():
                 bot.reply_to(message, "الرجاء إرسال رقم آيدي صحيح.")
                 return
