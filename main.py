@@ -17,7 +17,9 @@ import threading
 import shutil
 from collections import deque
 
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, UnidentifiedImageError
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = False
 
 try:
     import arabic_reshaper
@@ -105,6 +107,16 @@ class Database:
                     key TEXT PRIMARY KEY,
                     value TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id INTEGER PRIMARY KEY,
+                    watermark_text TEXT DEFAULT '',
+                    position TEXT DEFAULT 'c',
+                    font_index INTEGER DEFAULT -1,
+                    opacity INTEGER DEFAULT 25,
+                    auto_mode INTEGER DEFAULT 1,
+                    FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+                );
                 """
             )
             self._conn.commit()
@@ -123,6 +135,9 @@ class Database:
             "max_concurrent_per_user": "1",
             "max_concurrent_global": "4",
             "maintenance_mode": "0",
+            "max_text_length": "250",
+            "session_timeout_seconds": "900",
+            "max_pixels": "25000000",
         }
         with self._lock:
             cur = self._conn.cursor()
@@ -171,6 +186,49 @@ class Database:
                     "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?",
                     (username or "", first_name or "", user_id),
                 )
+            self._conn.commit()
+
+    def ensure_user_settings(self, user_id):
+        default_opacity = self.get_setting("default_opacity", 25, int)
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO user_settings "
+                "(user_id, opacity) VALUES (?, ?)",
+                (user_id, default_opacity),
+            )
+            self._conn.commit()
+
+    def get_user_settings(self, user_id):
+        self.ensure_user_settings(user_id)
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("SELECT * FROM user_settings WHERE user_id = ?", (user_id,))
+            row = cur.fetchone()
+            cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row)) if row else None
+
+    def update_user_settings(self, user_id, **values):
+        self.ensure_user_settings(user_id)
+        allowed = {"watermark_text", "position", "font_index", "opacity", "auto_mode"}
+        values = {k: v for k, v in values.items() if k in allowed}
+        if not values:
+            return
+        with self._lock:
+            sets = ", ".join(f"{k} = ?" for k in values)
+            params = list(values.values()) + [user_id]
+            self._conn.execute(
+                f"UPDATE user_settings SET {sets} WHERE user_id = ?", params
+            )
+            self._conn.commit()
+
+    def reset_user_settings(self, user_id):
+        default_opacity = self.get_setting("default_opacity", 25, int)
+        with self._lock:
+            self._conn.execute(
+                "UPDATE user_settings SET watermark_text='', position='c', "
+                "font_index=-1, opacity=?, auto_mode=1 WHERE user_id=?",
+                (default_opacity, user_id),
+            )
             self._conn.commit()
 
     def increment_images(self, user_id):
@@ -264,6 +322,8 @@ class FontManager:
     def __init__(self, folder):
         self.folder = folder
         self.fonts = []
+        self._cache = {}
+        self._lock = threading.Lock()
         self.reload()
 
     def reload(self):
@@ -273,8 +333,26 @@ class FontManager:
                 if name.lower().endswith((".ttf", ".otf")):
                     display = os.path.splitext(name)[0].replace("_", " ").replace("-", " ")
                     found.append((display, os.path.join(self.folder, name)))
-        self.fonts = found
+        with self._lock:
+            self.fonts = found
+            valid_paths = {p for _, p in found}
+            self._cache = {k: v for k, v in self._cache.items() if k[0] in valid_paths}
         return self.fonts
+
+    def get_font(self, index, size):
+        entry = self.get(index)
+        path = entry[1] if entry else None
+        key = (path, int(size))
+        with self._lock:
+            if key in self._cache:
+                return self._cache[key]
+        try:
+            font = ImageFont.truetype(path, int(size)) if path else ImageFont.load_default()
+        except Exception:
+            font = ImageFont.load_default()
+        with self._lock:
+            self._cache[key] = font
+        return font
 
     def get(self, index):
         if 0 <= index < len(self.fonts):
@@ -364,17 +442,14 @@ class WatermarkEngine:
                 return line
         return line
 
-    @staticmethod
-    def _load_font(font_path, size):
+    def _load_font(self, font_path, size):
         try:
-            if font_path:
-                return ImageFont.truetype(font_path, size)
+            for idx, (_display, path) in enumerate(self.fonts.fonts):
+                if path == font_path:
+                    return self.fonts.get_font(idx, size)
+            return self.fonts.get_font(-1, size)
         except Exception:
-            pass
-        try:
             return ImageFont.load_default()
-        except Exception:
-            return None
 
     def _wrap_text(self, draw, text, font, max_width):
         words = text.split(" ")
@@ -505,6 +580,19 @@ class WatermarkEngine:
             y += step_y
             row += 1
 
+    def apply_stream(self, input_stream, output_stream, text, position, font_path, opacity):
+        alpha = max(1, min(255, int(255 * (opacity / 100.0))))
+        with Image.open(input_stream) as img:
+            img = img.convert("RGBA")
+            if position == "tile":
+                self._apply_tiled(img, text, font_path, alpha)
+            else:
+                block, _, _ = self._render_text_block(text, font_path, alpha)
+                block = block.rotate(WATERMARK_ANGLE, expand=True, resample=Image.BICUBIC)
+                self._paste_with_position(img, block, position)
+            img.convert("RGB").save(output_stream, format="JPEG", quality=90, optimize=False)
+        return output_stream
+
     def apply(self, input_path, output_path, text, position, font_path, opacity):
         alpha = max(1, min(255, int(255 * (opacity / 100.0))))
         with Image.open(input_path) as img:
@@ -606,14 +694,17 @@ class SessionManager:
         self.sessions = {}   # user_id -> dict
         self.admin_state = {}  # user_id -> awaiting action string
 
-    def start(self, user_id, image_path):
+    def start(self, user_id, image_bytes):
+        self.clear(user_id)
         with self.lock:
             self.sessions[user_id] = {
                 "step": "waiting_text",
-                "image_path": image_path,
+                "created_at": time.time(),
+                "image_bytes": image_bytes,
                 "text": None,
                 "position": None,
-                "font_index": None,
+                "font_index": -1,
+                "opacity": None,
             }
 
     def get(self, user_id):
@@ -627,9 +718,7 @@ class SessionManager:
 
     def clear(self, user_id):
         with self.lock:
-            session = self.sessions.pop(user_id, None)
-        if session and session.get("image_path"):
-            _safe_remove(session["image_path"])
+            self.sessions.pop(user_id, None)
 
     def set_admin_state(self, user_id, state):
         with self.lock:
@@ -737,6 +826,47 @@ def opacity_keyboard():
 
 
 # =========================================================================
+# معالجة الصور السريعة والآمنة
+# =========================================================================
+
+def validate_and_prepare_image(file_bytes, max_mb, max_dim, max_pixels):
+    if not file_bytes or len(file_bytes) > max_mb * 1024 * 1024:
+        raise ValueError("size")
+    if len(file_bytes) < 16:
+        raise ValueError("invalid")
+    try:
+        with Image.open(io.BytesIO(file_bytes)) as probe:
+            probe.verify()
+        with Image.open(io.BytesIO(file_bytes)) as img:
+            width, height = img.size
+            if width < 1 or height < 1 or max(width, height) > max_dim:
+                raise ValueError("dimensions")
+            if width * height > max_pixels:
+                raise ValueError("pixels")
+            img.load()
+            safe = img.convert("RGBA")
+            return safe
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning):
+        raise ValueError("pixels")
+    except UnidentifiedImageError:
+        raise ValueError("invalid")
+
+
+def process_image_bytes(user_id, image_bytes, text, position, font_index, opacity):
+    # تم التحقق من الحجم والأبعاد والمحتوى قبل الوصول إلى هذه المرحلة،
+    # لذلك لا نكرر verify أو التحويل إلى PNG؛ هذا يقلل زمن المعالجة واستهلاك الذاكرة.
+    font_entry = font_manager.get(font_index)
+    font_path = font_entry[1] if font_entry else None
+    output = io.BytesIO()
+    try:
+        watermark_engine.apply_stream(io.BytesIO(image_bytes), output, text, position, font_path, opacity)
+        output.seek(0)
+        return output
+    except Exception:
+        output.close()
+        raise
+
+# =========================================================================
 # أوامر المستخدم
 # =========================================================================
 
@@ -758,11 +888,14 @@ def handle_start(message):
             send_subscribe_prompt(message.chat.id)
             return
 
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("إعداداتي", callback_data="usr:open"))
         bot.reply_to(
             message,
             "مرحبًا بك في بوت الحقوق المائية.\n\n"
-            "أرسل الصورة التي تريد إضافة الحقوق عليها، وسيقوم البوت بإرشادك "
-            "خطوة بخطوة لاختيار النص والمكان والخط ونسبة الشفافية.",
+            "أرسل الصورة. عند ضبط إعداداتك مرة واحدة سيستخدمها البوت تلقائيًا في الصور التالية.\n\n"
+            "يمكنك تعديل إعداداتك من الزر التالي أو باستخدام /settings.",
+            reply_markup=kb,
         )
     except Exception as e:
         log.warning("start error: %s", e)
@@ -792,31 +925,27 @@ def handle_photo(message):
     user_id = message.from_user.id
     try:
         db.touch_user(user_id, message.from_user.username, message.from_user.first_name)
-
+        db.ensure_user_settings(user_id)
         if db.is_banned(user_id):
             bot.reply_to(message, "أنت محظور حاليًا من استخدام هذا البوت.")
             return
-
         if db.get_setting("maintenance_mode", "0") == "1" and not is_admin(user_id):
             bot.reply_to(message, "البوت في وضع الصيانة حاليًا، الرجاء المحاولة لاحقًا.")
             return
-
         if not is_subscribed(user_id):
             send_subscribe_prompt(message.chat.id)
             return
-
         allowed, flood_msg = flood.check_and_register(user_id)
         if not allowed:
             bot.reply_to(message, flood_msg)
             return
 
-        # تحديد الملف والتحقق من نوعه
         if message.content_type == "photo":
             file_info_id = message.photo[-1].file_id
             declared_size = message.photo[-1].file_size or 0
         else:
             doc = message.document
-            mime = (doc.mime_type or "")
+            mime = (doc.mime_type or "").lower()
             if not mime.startswith("image/"):
                 bot.reply_to(message, "هذا النوع من الملفات غير مدعوم، الرجاء إرسال صورة.")
                 return
@@ -825,52 +954,57 @@ def handle_photo(message):
 
         max_mb = db.get_setting("max_image_mb", 10, int)
         if declared_size and declared_size > max_mb * 1024 * 1024:
-            bot.reply_to(
-                message,
-                f"حجم الصورة أكبر من الحد المسموح به ({max_mb} ميجابايت).",
-            )
+            bot.reply_to(message, f"حجم الصورة أكبر من الحد المسموح به ({max_mb} ميجابايت).")
             return
 
         file_info = bot.get_file(file_info_id)
         file_bytes = bot.download_file(file_info.file_path)
-
-        if len(file_bytes) > max_mb * 1024 * 1024:
-            bot.reply_to(
-                message, f"حجم الصورة أكبر من الحد المسموح به ({max_mb} ميجابايت)."
-            )
-            return
-
-        try:
-            img = Image.open(io.BytesIO(file_bytes))
-            img.verify()
-            img = Image.open(io.BytesIO(file_bytes))  # verify يغلق الملف، نعيد الفتح
-        except Exception:
-            bot.reply_to(message, "تعذر التعرف على الصورة، الرجاء إرسال صورة صالحة.")
-            return
-
         max_dim = db.get_setting("max_image_dimension", 6000, int)
-        if max(img.size) > max_dim:
-            bot.reply_to(
-                message,
-                "أبعاد الصورة كبيرة جدًا، الرجاء إرسال صورة بأبعاد أصغر.",
-            )
+        max_pixels = db.get_setting("max_pixels", 25000000, int)
+        try:
+            img = validate_and_prepare_image(file_bytes, max_mb, max_dim, max_pixels)
+            suspicious = ContentModerator.looks_suspicious(img)
+            img.close()
+        except ValueError as exc:
+            reason = str(exc)
+            if reason in ("size",):
+                bot.reply_to(message, f"حجم الصورة أكبر من الحد المسموح به ({max_mb} ميجابايت).")
+            elif reason in ("dimensions", "pixels"):
+                bot.reply_to(message, "أبعاد الصورة أو حجمها الداخلي أكبر من الحد الآمن المسموح به.")
+            else:
+                bot.reply_to(message, "تعذر التعرف على الصورة، الرجاء إرسال صورة صالحة.")
+            return
+        if suspicious:
+            bot.reply_to(message, "تم رفض هذه الصورة لأنها قد تحتوي على محتوى غير مسموح به.")
             return
 
-        if ContentModerator.looks_suspicious(img):
-            bot.reply_to(
-                message,
-                "تم رفض هذه الصورة لأنها قد تحتوي على محتوى غير مسموح به.",
-            )
+        user_settings = db.get_user_settings(user_id)
+        if user_settings and user_settings["auto_mode"] and user_settings["watermark_text"]:
+            position = user_settings["position"] or "c"
+            opacity = int(user_settings["opacity"] or db.get_setting("default_opacity", 25, int))
+            font_index = int(user_settings["font_index"] if user_settings["font_index"] is not None else -1)
+            ok, msg = flood.try_acquire_slot(user_id)
+            if not ok:
+                bot.reply_to(message, msg)
+                return
+            try:
+                status = bot.reply_to(message, "جاري معالجة الصورة...")
+                result = process_image_bytes(user_id, file_bytes, user_settings["watermark_text"], position, font_index, opacity)
+                try:
+                    bot.delete_message(message.chat.id, status.message_id)
+                except Exception:
+                    pass
+                bot.send_photo(message.chat.id, result, caption="تم إضافة الحقوق بنجاح.")
+                result.close()
+                db.increment_images(user_id)
+            finally:
+                flood.release_slot(user_id)
             return
 
-        user_dir = _user_temp_dir(user_id)
-        image_path = os.path.join(user_dir, f"src_{int(time.time())}.png")
-        img.convert("RGB").save(image_path, format="PNG")
-
-        sessions.start(user_id, image_path)
+        sessions.start(user_id, file_bytes)
         bot.reply_to(
             message,
-            "تم استلام الصورة. الرجاء الآن كتابة النص الذي تريد وضعه كحقوق ملكية.",
+            "تم استلام الصورة. أرسل نص الحقوق، أو استخدم إعداداتي لحفظه للاستخدام التلقائي لاحقًا."
         )
     except Exception as e:
         log.warning("photo handler error: %s", e)
@@ -888,6 +1022,20 @@ def handle_text(message):
     # أوامر عامة
     if text == "/admin":
         return handle_admin_entry(message)
+
+    # حالة إدخال إعدادات المستخدم
+    state = sessions.get_admin_state(user_id)
+    if state == "user_text":
+        if not text or len(text) > db.get_setting("max_text_length", 250, int):
+            bot.reply_to(message, "النص غير صالح أو أطول من الحد المسموح.")
+            return
+        db.update_user_settings(user_id, watermark_text=text)
+        sessions.set_admin_state(user_id, None)
+        bot.reply_to(message, "تم حفظ نص الحقوق الافتراضي.")
+        return
+    if state and state.startswith("user_"):
+        # أزرار الإعدادات تعالج الاختيار، ولا نحتاج ردًا على الرسائل النصية هنا.
+        pass
 
     # حالة انتظار إدخال من الأدمن
     admin_state = sessions.get_admin_state(user_id)
@@ -908,6 +1056,7 @@ def handle_text(message):
             return
 
         sessions.update(user_id, text=text, step="waiting_position")
+        db.update_user_settings(user_id, watermark_text=text)
         bot.reply_to(message, "اختر مكان الحقوق على الصورة:", reply_markup=position_keyboard())
     except Exception as e:
         log.warning("text handler error: %s", e)
@@ -917,12 +1066,21 @@ def handle_text(message):
 def handle_position_choice(call):
     user_id = call.from_user.id
     try:
+        state = sessions.get_admin_state(user_id)
+        if state == "user_position":
+            position = call.data.split(":", 1)[1]
+            db.update_user_settings(user_id, position=position)
+            sessions.set_admin_state(user_id, None)
+            bot.answer_callback_query(call.id, "تم حفظ الموضع.")
+            show_user_settings(call.message.chat.id, call.message.message_id, user_id)
+            return
         session = sessions.get(user_id)
         if not session or session.get("step") != "waiting_position":
             bot.answer_callback_query(call.id, "انتهت صلاحية هذه الخطوة، ابدأ من جديد بإرسال صورة.")
             return
         position = call.data.split(":", 1)[1]
         sessions.update(user_id, position=position, step="waiting_font")
+        db.update_user_settings(user_id, position=position)
         bot.answer_callback_query(call.id)
         font_manager.reload()
         bot.edit_message_text(
@@ -939,12 +1097,21 @@ def handle_position_choice(call):
 def handle_font_choice(call):
     user_id = call.from_user.id
     try:
+        state = sessions.get_admin_state(user_id)
+        if state == "user_font":
+            font_index = int(call.data.split(":", 1)[1])
+            db.update_user_settings(user_id, font_index=font_index)
+            sessions.set_admin_state(user_id, None)
+            bot.answer_callback_query(call.id, "تم حفظ الخط.")
+            show_user_settings(call.message.chat.id, call.message.message_id, user_id)
+            return
         session = sessions.get(user_id)
         if not session or session.get("step") != "waiting_font":
             bot.answer_callback_query(call.id, "انتهت صلاحية هذه الخطوة، ابدأ من جديد بإرسال صورة.")
             return
         font_index = int(call.data.split(":", 1)[1])
         sessions.update(user_id, font_index=font_index, step="waiting_opacity")
+        db.update_user_settings(user_id, font_index=font_index)
         bot.answer_callback_query(call.id)
         bot.edit_message_text(
             "اختر نسبة شفافية الحقوق:",
@@ -961,54 +1128,45 @@ def handle_opacity_choice(call):
     user_id = call.from_user.id
     chat_id = call.message.chat.id
     try:
+        state = sessions.get_admin_state(user_id)
+        if state == "user_opacity":
+            opacity = int(call.data.split(":", 1)[1])
+            db.update_user_settings(user_id, opacity=opacity)
+            sessions.set_admin_state(user_id, None)
+            bot.answer_callback_query(call.id, "تم حفظ الشفافية.")
+            show_user_settings(chat_id, call.message.message_id, user_id)
+            return
         session = sessions.get(user_id)
         if not session or session.get("step") != "waiting_opacity":
             bot.answer_callback_query(call.id, "انتهت صلاحية هذه الخطوة، ابدأ من جديد بإرسال صورة.")
             return
-
         if not is_subscribed(user_id):
             bot.answer_callback_query(call.id)
             send_subscribe_prompt(chat_id)
             return
-
         opacity = int(call.data.split(":", 1)[1])
-        bot.answer_callback_query(call.id, "جاري معالجة الصورة...")
-
+        db.update_user_settings(user_id, opacity=opacity)
+        bot.answer_callback_query(call.id, "تم حفظ الإعداد.")
         allowed, msg = flood.try_acquire_slot(user_id)
         if not allowed:
             bot.send_message(chat_id, msg)
             return
-
         try:
-            bot.edit_message_text(
-                "جاري معالجة الصورة، الرجاء الانتظار...",
-                chat_id,
-                call.message.message_id,
-            )
-
-            font_entry = font_manager.get(session["font_index"])
-            font_path = font_entry[1] if font_entry else None
-
-            input_path = session["image_path"]
-            output_path = input_path.replace("src_", "out_").rsplit(".", 1)[0] + ".jpg"
-
-            watermark_engine.apply(
-                input_path,
-                output_path,
-                session["text"],
-                session["position"],
-                font_path,
-                opacity,
-            )
-
-            with open(output_path, "rb") as f:
-                bot.send_photo(chat_id, f, caption="تم إضافة الحقوق بنجاح.")
-
+            bot.edit_message_text("جاري معالجة الصورة...", chat_id, call.message.message_id)
+            font_index = int(session.get("font_index", -1))
+            result = process_image_bytes(user_id, session["image_bytes"], session["text"], session["position"], font_index, opacity)
+            bot.send_photo(chat_id, result, caption="تم إضافة الحقوق بنجاح.")
+            result.close()
             db.increment_images(user_id)
-            _safe_remove(output_path)
         finally:
             flood.release_slot(user_id)
             sessions.clear(user_id)
+    except ValueError as e:
+        if str(e) == "content":
+            bot.send_message(chat_id, "تم رفض هذه الصورة لأنها قد تحتوي على محتوى غير مسموح به.")
+        else:
+            bot.send_message(chat_id, "تعذر معالجة الصورة بسبب حدود الأمان أو صيغة الصورة.")
+        sessions.clear(user_id)
     except Exception as e:
         log.warning("opacity choice error: %s", e)
         try:
@@ -1017,6 +1175,95 @@ def handle_opacity_choice(call):
             pass
         sessions.clear(user_id)
 
+
+# =========================================================================
+# إعدادات المستخدم
+# =========================================================================
+
+def user_settings_keyboard(uid):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    s = db.get_user_settings(uid)
+    auto_label = "تعطيل المعالجة التلقائية" if s and s["auto_mode"] else "تفعيل المعالجة التلقائية"
+    kb.add(
+        types.InlineKeyboardButton("تغيير نص الحقوق", callback_data="usr:text"),
+        types.InlineKeyboardButton("تغيير الموضع", callback_data="usr:position"),
+        types.InlineKeyboardButton("تغيير الخط", callback_data="usr:font"),
+        types.InlineKeyboardButton("تغيير الشفافية", callback_data="usr:opacity"),
+        types.InlineKeyboardButton(auto_label, callback_data="usr:auto"),
+        types.InlineKeyboardButton("إعادة الإعدادات الافتراضية", callback_data="usr:reset"),
+    )
+    return kb
+
+_current_settings_user = []
+
+def show_user_settings(chat_id, message_id=None, user_id=None):
+    global _current_settings_user
+    uid = user_id if user_id is not None else chat_id
+    db.ensure_user_settings(uid)
+    s = db.get_user_settings(uid)
+    font_entry = font_manager.get(int(s["font_index"] or -1))
+    font_name = font_entry[0] if font_entry else "الافتراضي"
+    text = (
+        "إعداداتك الحالية:\n\n"
+        f"الحقوق: {s['watermark_text'] or 'غير محددة'}\n"
+        f"الموضع: {POSITIONS.get(s['position'], s['position'])}\n"
+        f"الخط: {font_name}\n"
+        f"الشفافية: {s['opacity']}%\n"
+        f"المعالجة التلقائية: {'مفعلة' if s['auto_mode'] else 'غير مفعلة'}"
+    )
+    _current_settings_user[:] = [uid]
+    kb = user_settings_keyboard(uid)
+    if message_id:
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+    else:
+        bot.send_message(chat_id, text, reply_markup=kb)
+
+@bot.message_handler(commands=["settings"])
+def handle_settings_command(message):
+    if not is_subscribed(message.from_user.id):
+        send_subscribe_prompt(message.chat.id)
+        return
+    show_user_settings(message.chat.id, user_id=message.from_user.id)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("usr:"))
+def handle_user_settings_callback(call):
+    uid = call.from_user.id
+    if db.is_banned(uid):
+        bot.answer_callback_query(call.id, "أنت محظور حاليًا.", show_alert=True)
+        return
+    action = call.data.split(":", 1)[1]
+    try:
+        if action == "open":
+            bot.answer_callback_query(call.id)
+            show_user_settings(call.message.chat.id, call.message.message_id, uid)
+        elif action == "text":
+            sessions.set_admin_state(uid, "user_text")
+            bot.answer_callback_query(call.id)
+            bot.send_message(call.message.chat.id, "أرسل نص الحقوق الجديد. سيتم حفظه واستخدامه تلقائيًا.")
+        elif action == "position":
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text("اختر الموضع الافتراضي:", call.message.chat.id, call.message.message_id, reply_markup=position_keyboard())
+            sessions.set_admin_state(uid, "user_position")
+        elif action == "font":
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text("اختر الخط الافتراضي:", call.message.chat.id, call.message.message_id, reply_markup=font_keyboard())
+            sessions.set_admin_state(uid, "user_font")
+        elif action == "opacity":
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text("اختر الشفافية الافتراضية:", call.message.chat.id, call.message.message_id, reply_markup=opacity_keyboard())
+            sessions.set_admin_state(uid, "user_opacity")
+        elif action == "auto":
+            s = db.get_user_settings(uid)
+            db.update_user_settings(uid, auto_mode=0 if s["auto_mode"] else 1)
+            bot.answer_callback_query(call.id, "تم تحديث الإعداد.")
+            show_user_settings(call.message.chat.id, call.message.message_id, uid)
+        elif action == "reset":
+            db.reset_user_settings(uid)
+            sessions.set_admin_state(uid, None)
+            bot.answer_callback_query(call.id, "تمت إعادة الإعدادات.")
+            show_user_settings(call.message.chat.id, call.message.message_id, uid)
+    except Exception as e:
+        log.warning("user settings callback error: %s", e)
 
 # =========================================================================
 # لوحة تحكم الأدمن
@@ -1348,7 +1595,7 @@ def cleanup_old_temp_files():
 def cleanup_loop():
     while True:
         cleanup_old_temp_files()
-        time.sleep(1800)
+        time.sleep(60)
 
 
 def main():
