@@ -2029,4 +2029,9 @@ def main():
         try:
             bot.infinity_polling(timeout=20, long_polling_timeout=20, skip_pending=True)
         except Exception as e:
-            log.warning("polling 
+            log.warning("polling error: %s", e)
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()
