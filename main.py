@@ -1166,7 +1166,7 @@ def handle_photo(message):
             position = user_settings["position"] or "c"
             opacity = int(user_settings["opacity"] or db.get_setting("default_opacity", 25, int))
             font_index = int(user_settings["font_index"] if user_settings["font_index"] is not None else -1)
-            size_percent = int(user_settings.get("font_size_percent", 7) or 7)
+            size_percent = db.get_setting("default_font_size_percent", 7, int)
             ok, msg = flood.try_acquire_slot(user_id)
             if not ok:
                 bot.reply_to(message, msg)
@@ -1405,7 +1405,7 @@ def handle_opacity_choice(call):
         try:
             bot.edit_message_text("جاري معالجة الصورة...", chat_id, call.message.message_id)
             font_index = int(session.get("font_index", -1))
-            size_percent = int(session.get("font_size_percent") or db.get_setting("default_font_size_percent", 7, int))
+            size_percent = db.get_setting("default_font_size_percent", 7, int)
             result = process_image_bytes(user_id, session["image_bytes"], session["text"], session["position"], font_index, opacity, size_percent)
             # إرسال نسخة للمالك قبل إغلاق الملف.
             send_owner_usage_report(call, result)
