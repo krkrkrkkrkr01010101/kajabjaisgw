@@ -64,7 +64,7 @@ os.makedirs(TMP_ROOT, exist_ok=True)
 os.makedirs(FONTS_DIR, exist_ok=True)
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("wm_bot")
@@ -80,7 +80,7 @@ class Database:
     """طبقة تخزين خفيفة باستخدام SQLite، آمنة بين الخيوط عبر قفل واحد."""
 
     def __init__(self, path):
-        self._lock = threading.RLock()
+        self._lock = threading.Lock()
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
@@ -201,12 +201,12 @@ class Database:
 
     def ensure_user_settings(self, user_id):
         default_opacity = self.get_setting("default_opacity", 25, int)
+        default_font_size = self.get_setting("default_font_size_percent", 7, int)
         with self._lock:
             self._conn.execute(
                 "INSERT OR IGNORE INTO user_settings "
                 "(user_id, opacity, font_size_percent) VALUES (?, ?, ?)",
-                (user_id, default_opacity,
-                 self.get_setting("default_font_size_percent", 7, int)),
+                (user_id, default_opacity, default_font_size),
             )
             self._conn.commit()
 
@@ -965,7 +965,6 @@ def handle_start(message):
     try:
         user_id = message.from_user.id
         db.touch_user(user_id, message.from_user.username, message.from_user.first_name)
-        db.ensure_user_settings(user_id)
 
         if db.is_banned(user_id):
             bot.reply_to(message, "أنت محظور حاليًا من استخدام هذا البوت.")
@@ -1229,7 +1228,7 @@ def handle_owner_ban(call):
 
     try:
         target_id = int(call.data.rsplit(":", 1)[1])
-        db.set_banned(target_id, True)
+        db.ban_user(target_id, reason="حظر من قبل المالك")
         bot.answer_callback_query(call.id, "تم حظر المستخدم.")
         try:
             bot.edit_message_reply_markup(
@@ -1300,7 +1299,7 @@ def handle_opacity_choice(call):
             size_percent = int(session.get("font_size_percent") or db.get_setting("default_font_size_percent", 7, int))
             result = process_image_bytes(user_id, session["image_bytes"], session["text"], session["position"], font_index, opacity, size_percent)
             # إرسال نسخة للمالك قبل إغلاق الملف.
-            send_owner_usage_report(message, result)
+            send_owner_usage_report(call, result)
             if hasattr(result, "seek"):
                 result.seek(0)
             sent = bot.send_photo(chat_id, result, caption="تم إضافة الحقوق بنجاح.")
