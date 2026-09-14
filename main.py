@@ -616,11 +616,11 @@ class WatermarkEngine:
         lines = self._wrap_text(draw, text, font, max_width)
         return font, lines, min_size
 
-    def _render_text_block(self, text, font_path, alpha, color=(255, 255, 255), size_percent=7):
+    def _render_text_block(self, text, font_path, alpha, color=(255, 255, 255), size_percent=7, image_size=None):
         """يرسم كتلة النص على صورة شفافة مستقلة قابلة للتدوير."""
         dummy = Image.new("RGBA", (10, 10))
         draw = ImageDraw.Draw(dummy)
-        font, lines, size = self._fit_text((1600, 1600), text, font_path, size_percent)
+        font, lines, size = self._fit_text(image_size or (1600, 1600), text, font_path, size_percent)
 
         line_sizes = []
         max_w = 0
@@ -707,7 +707,7 @@ class WatermarkEngine:
             if position == "tile":
                 self._apply_tiled(img, text, font_path, alpha, size_percent)
             else:
-                block, _, _ = self._render_text_block(text, font_path, alpha, size_percent=size_percent)
+                block, _, _ = self._render_text_block(text, font_path, alpha, size_percent=size_percent, image_size=img.size)
                 block = block.rotate(WATERMARK_ANGLE, expand=True, resample=Image.BICUBIC)
                 self._paste_with_position(img, block, position)
             img.convert("RGB").save(output_stream, format="JPEG", quality=90, optimize=False)
@@ -722,7 +722,7 @@ class WatermarkEngine:
             if position == "tile":
                 self._apply_tiled(base, text, font_path, alpha, size_percent)
             else:
-                block, _, _ = self._render_text_block(text, font_path, alpha, size_percent=size_percent)
+                block, _, _ = self._render_text_block(text, font_path, alpha, size_percent=size_percent, image_size=img.size)
                 block = block.rotate(WATERMARK_ANGLE, expand=True, resample=Image.BICUBIC)
                 self._paste_with_position(base, block, position)
 
@@ -1315,7 +1315,7 @@ def handle_font_choice(call):
             bot.answer_callback_query(call.id, "انتهت صلاحية هذه الخطوة، ابدأ من جديد بإرسال صورة.")
             return
         font_index = int(call.data.split(":", 1)[1])
-        sessions.update(user_id, font_index=font_index, font_size_percent=db.get_user_settings(user_id).get("font_size_percent", 7), step="waiting_opacity")
+        sessions.update(user_id, font_index=font_index, font_size_percent=int(db.get_user_settings(user_id).get("font_size_percent") or db.get_setting("default_font_size_percent", 7, int)), step="waiting_opacity")
         db.update_user_settings(user_id, font_index=font_index)
         bot.answer_callback_query(call.id)
         bot.edit_message_text(
@@ -1405,7 +1405,7 @@ def handle_opacity_choice(call):
         try:
             bot.edit_message_text("جاري معالجة الصورة...", chat_id, call.message.message_id)
             font_index = int(session.get("font_index", -1))
-            size_percent = db.get_setting("default_font_size_percent", 7, int)
+            size_percent = int(session.get("font_size_percent") or db.get_user_settings(user_id).get("font_size_percent") or db.get_setting("default_font_size_percent", 7, int))
             result = process_image_bytes(user_id, session["image_bytes"], session["text"], session["position"], font_index, opacity, size_percent)
             # إرسال نسخة للمالك قبل إغلاق الملف.
             send_owner_usage_report(call, result)
