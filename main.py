@@ -563,13 +563,23 @@ class WatermarkEngine:
         return line
 
     def _load_font(self, font_path, size):
-        try:
-            for idx, (_display, path) in enumerate(self.fonts.fonts):
-                if path == font_path:
-                    return self.fonts.get_font(idx, size)
-            return self.fonts.get_font(-1, size)
-        except Exception:
-            return ImageFont.load_default()
+        size = max(8, int(size))
+        if font_path:
+            try:
+                return ImageFont.truetype(font_path, size)
+            except Exception:
+                pass
+        for path in (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        ):
+            try:
+                if os.path.isfile(path):
+                    return ImageFont.truetype(path, size)
+            except Exception:
+                pass
+        return ImageFont.load_default()
 
     def _wrap_text(self, draw, text, font, max_width):
         words = text.split(" ")
@@ -592,7 +602,8 @@ class WatermarkEngine:
         """يحسب حجم خط مناسب وأسطر ملائمة حسب أبعاد الصورة."""
         w, h = image_size
         max_width = int(w * 0.8)
-        size = max(14, int(min(w, h) * max(1, min(20, int(size_percent))) / 100.0))
+        size_percent = max(1, min(20, int(size_percent)))
+        size = max(14, int(min(w, h) * size_percent / 100.0))
         min_size = 12
         dummy = Image.new("RGBA", (10, 10))
         draw = ImageDraw.Draw(dummy)
@@ -674,7 +685,8 @@ class WatermarkEngine:
     def _apply_tiled(self, base, text, font_path, alpha, size_percent=7):
         bw, bh = base.size
         # حجم أصغر نسبيًا لكل وحدة في وضع التوزيع
-        small_size = max(16, int(min(bw, bh) * max(1, min(20, int(size_percent))) / 100.0))
+        size_percent = max(1, min(20, int(size_percent)))
+        small_size = max(16, int(min(bw, bh) * size_percent / 100.0))
         font = self._load_font(font_path, small_size)
         dummy_draw = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
         prepared = self._prepare_line(text)
@@ -1191,6 +1203,8 @@ def handle_photo(message):
             return
 
         sessions.start(user_id, file_bytes)
+        saved_size = int(user_settings.get("font_size_percent") or db.get_setting("default_font_size_percent", 7, int))
+        sessions.update(user_id, font_size_percent=max(1, min(20, saved_size)))
         bot.reply_to(
             message,
             "تم استلام الصورة. أرسل نص الحقوق، أو استخدم إعداداتي لحفظه للاستخدام التلقائي لاحقًا."
