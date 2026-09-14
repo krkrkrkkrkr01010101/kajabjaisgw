@@ -64,7 +64,7 @@ os.makedirs(TMP_ROOT, exist_ok=True)
 os.makedirs(FONTS_DIR, exist_ok=True)
 
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("wm_bot")
@@ -80,7 +80,7 @@ class Database:
     """طبقة تخزين خفيفة باستخدام SQLite، آمنة بين الخيوط عبر قفل واحد."""
 
     def __init__(self, path):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
@@ -965,6 +965,7 @@ def handle_start(message):
     try:
         user_id = message.from_user.id
         db.touch_user(user_id, message.from_user.username, message.from_user.first_name)
+        db.ensure_user_settings(user_id)
 
         if db.is_banned(user_id):
             bot.reply_to(message, "أنت محظور حاليًا من استخدام هذا البوت.")
