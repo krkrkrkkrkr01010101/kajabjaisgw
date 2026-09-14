@@ -30,6 +30,7 @@ except Exception:
 
 import telebot
 from telebot import types
+from telebot.apihelper import ApiTelegramException
 
 
 # =========================================================================
@@ -100,7 +101,10 @@ class Database:
                     images_count INTEGER DEFAULT 0,
                     is_banned INTEGER DEFAULT 0,
                     banned_until INTEGER DEFAULT 0,
-                    ban_reason TEXT DEFAULT ''
+                    ban_reason TEXT DEFAULT '',
+                    blocked_bot INTEGER DEFAULT 0,
+                    blocked_at INTEGER DEFAULT 0,
+                    last_active INTEGER DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS settings (
@@ -118,16 +122,31 @@ class Database:
                     auto_mode INTEGER DEFAULT 1,
                     FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_users_joined_at ON users(joined_at);
+                CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active);
+                CREATE INDEX IF NOT EXISTS idx_users_is_banned ON users(is_banned);
+                CREATE INDEX IF NOT EXISTS idx_users_blocked_bot ON users(blocked_bot);
                 """
             )
             self._conn.commit()
 
+            # ترقية آمنة لقواعد البيانات القديمة التي أُنشئت قبل إضافة هذه الأعمدة
             cur.execute("PRAGMA table_info(user_settings)")
             columns = {row[1] for row in cur.fetchall()}
             if "font_size_percent" not in columns:
                 cur.execute(
                     "ALTER TABLE user_settings ADD COLUMN font_size_percent INTEGER DEFAULT 7"
                 )
+
+            cur.execute("PRAGMA table_info(users)")
+            user_columns = {row[1] for row in cur.fetchall()}
+            if "blocked_bot" not in user_columns:
+                cur.execute("ALTER TABLE users ADD COLUMN blocked_bot INTEGER DEFAULT 0")
+            if "blocked_at" not in user_columns:
+                cur.execute("ALTER TABLE users ADD COLUMN blocked_at INTEGER DEFAULT 0")
+            if "last_active" not in user_columns:
+                cur.execute("ALTER TABLE users ADD COLUMN last_active INTEGER DEFAULT 0")
             self._conn.commit()
 
     def _init_default_settings(self):
@@ -183,19 +202,22 @@ class Database:
 
     # ---------------- مستخدمون ----------------
     def touch_user(self, user_id, username, first_name):
+        now = int(time.time())
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
             if cur.fetchone() is None:
                 cur.execute(
-                    "INSERT INTO users (user_id, username, first_name, joined_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (user_id, username or "", first_name or "", int(time.time())),
+                    "INSERT INTO users (user_id, username, first_name, joined_at, last_active) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (user_id, username or "", first_name or "", now, now),
                 )
             else:
+                # أي تفاعل من المستخدم يثبت أنه لم يعد يحظر البوت، ويحدّث آخر نشاط له
                 cur.execute(
-                    "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?",
-                    (username or "", first_name or "", user_id),
+                    "UPDATE users SET username = ?, first_name = ?, last_active = ?, "
+                    "blocked_bot = 0, blocked_at = 0 WHERE user_id = ?",
+                    (username or "", first_name or "", now, user_id),
                 )
             self._conn.commit()
 
@@ -305,16 +327,84 @@ class Database:
         with self._lock:
             cur = self._conn.cursor()
             cur.execute(
-                "SELECT COUNT(*) FROM users WHERE joined_at > ?",
+                "SELECT COUNT(*) FROM users WHERE last_active > ?",
                 (int(time.time()) - seconds,),
             )
             return cur.fetchone()[0]
+
+    def activity_summary(self):
+        """استعلام واحد مجمّع بدل عدة استعلامات منفصلة، لتخفيف الحمل على
+        استضافة Railway المجانية المحدودة الموارد."""
+        now = int(time.time())
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT "
+                "SUM(CASE WHEN last_active > ? THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN last_active > ? THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN last_active > ? THEN 1 ELSE 0 END), "
+                "COUNT(*), "
+                "SUM(CASE WHEN is_banned = 1 THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN blocked_bot = 1 THEN 1 ELSE 0 END) "
+                "FROM users",
+                (now - 86400, now - 7 * 86400, now - 30 * 86400),
+            )
+            row = cur.fetchone()
+        return {
+            "day": row[0] or 0,
+            "week": row[1] or 0,
+            "month": row[2] or 0,
+            "total": row[3] or 0,
+            "banned": row[4] or 0,
+            "blocked": row[5] or 0,
+        }
 
     def all_user_ids(self):
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("SELECT user_id FROM users")
             return [row[0] for row in cur.fetchall()]
+
+    def broadcastable_user_ids(self):
+        """يستثني من سبق واكتُشف أنه حظر البوت، لتقليل عدد الطلبات
+        وتسريع الإذاعة على استضافة محدودة الموارد مثل Railway المجانية."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("SELECT user_id FROM users WHERE blocked_bot = 0")
+            return [row[0] for row in cur.fetchall()]
+
+    # ---------------- من حظر البوت ----------------
+    def mark_blocked(self, user_id):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET blocked_bot = 1, blocked_at = ? WHERE user_id = ?",
+                (int(time.time()), user_id),
+            )
+            self._conn.commit()
+
+    def unmark_blocked(self, user_id):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET blocked_bot = 0, blocked_at = 0 WHERE user_id = ?",
+                (user_id,),
+            )
+            self._conn.commit()
+
+    def count_blocked(self):
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM users WHERE blocked_bot = 1")
+            return cur.fetchone()[0]
+
+    def list_blocked(self, limit=15):
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT user_id, username, first_name, blocked_at FROM users "
+                "WHERE blocked_bot = 1 ORDER BY blocked_at DESC LIMIT ?",
+                (limit,),
+            )
+            return cur.fetchall()
 
     def stats(self):
         with self._lock:
@@ -330,11 +420,14 @@ class Database:
                 (int(time.time()) - 86400,),
             )
             new_today = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM users WHERE blocked_bot = 1")
+            blocked = cur.fetchone()[0]
         return {
             "total": total,
             "banned": banned,
             "images": images,
             "new_today": new_today,
+            "blocked": blocked,
         }
 
 
@@ -1435,6 +1528,7 @@ def admin_main_keyboard():
         types.InlineKeyboardButton("الإذاعة", callback_data="adm:broadcast"),
         types.InlineKeyboardButton("المستخدمون النشطون", callback_data="adm:active"),
         types.InlineKeyboardButton("إدارة المحظورين", callback_data="adm:banned"),
+        types.InlineKeyboardButton("من حظر البوت", callback_data="adm:blocked"),
         types.InlineKeyboardButton("الاشتراك الإجباري", callback_data="adm:sub"),
         types.InlineKeyboardButton("إعدادات الحماية من الفلود", callback_data="adm:flood"),
         types.InlineKeyboardButton("إعدادات حجم الصور", callback_data="adm:size"),
@@ -1484,17 +1578,15 @@ def handle_admin_callbacks(call):
             )
 
         elif data == "adm:active":
-            day = db.active_users(86400)
-            week = db.active_users(7 * 86400)
-            month = db.active_users(30 * 86400)
-            s = db.stats()
+            summary = db.activity_summary()
             text = (
                 "إحصائيات النشاط:\n\n"
-                f"نشط خلال آخر 24 ساعة: {day}\n"
-                f"نشط خلال آخر 7 أيام: {week}\n"
-                f"نشط خلال آخر 30 يومًا: {month}\n"
-                f"إجمالي المستخدمين: {s['total']}\n"
-                f"المحظورون: {s['banned']}"
+                f"نشط خلال آخر 24 ساعة: {summary['day']}\n"
+                f"نشط خلال آخر 7 أيام: {summary['week']}\n"
+                f"نشط خلال آخر 30 يومًا: {summary['month']}\n"
+                f"إجمالي المستخدمين: {summary['total']}\n"
+                f"المحظورون من الأدمن: {summary['banned']}\n"
+                f"من حظر البوت: {summary['blocked']}"
             )
             bot.edit_message_text(text, chat_id, msg_id, reply_markup=back_button())
 
@@ -1504,7 +1596,8 @@ def handle_admin_callbacks(call):
                 "إحصائيات البوت:\n\n"
                 f"إجمالي المستخدمين: {s['total']}\n"
                 f"مستخدمون جدد اليوم: {s['new_today']}\n"
-                f"عدد المحظورين: {s['banned']}\n"
+                f"عدد المحظورين من الأدمن: {s['banned']}\n"
+                f"عدد من حظر البوت: {s['blocked']}\n"
                 f"إجمالي الصور المعالجة: {s['images']}"
             )
             bot.edit_message_text(text, chat_id, msg_id, reply_markup=back_button())
@@ -1524,6 +1617,15 @@ def handle_admin_callbacks(call):
                 "أرسل رقم آيدي المستخدم الذي تريد حظره:",
                 chat_id, msg_id, reply_markup=back_button("adm:banned"),
             )
+
+        elif data == "adm:blocked":
+            show_blocked_list(chat_id, msg_id)
+
+        elif data.startswith("adm:unblock:"):
+            target = int(data.split(":")[2])
+            db.unmark_blocked(target)
+            bot.answer_callback_query(call.id, "تمت إزالته من القائمة.")
+            show_blocked_list(chat_id, msg_id)
 
         elif data == "adm:sub":
             show_sub_menu(chat_id, msg_id)
@@ -1569,6 +1671,14 @@ def handle_admin_callbacks(call):
             bot.edit_message_text(
                 "اختر الحجم الافتراضي للحقوق:",
                 chat_id, msg_id, reply_markup=font_size_keyboard()
+            )
+
+        elif data == "adm:delete:custom":
+            sessions.set_admin_state(user_id, "awaiting_delete_seconds")
+            bot.edit_message_text(
+                "أرسل عدد الثواني الذي تريد حذف الصورة المرسلة بعده (من 1 إلى 3600)، "
+                "أو أرسل 0 لتعطيل الحذف التلقائي:",
+                chat_id, msg_id, reply_markup=back_button("adm:appearance"),
             )
 
         elif data.startswith("adm:delete:"):
@@ -1621,6 +1731,29 @@ def show_banned_list(chat_id, msg_id):
             label = f"فك حظر {username or user_id}"
             kb.add(types.InlineKeyboardButton(label, callback_data=f"adm:unban:{user_id}"))
     kb.add(types.InlineKeyboardButton("حظر مستخدم جديد", callback_data="adm:ban:new"))
+    kb.add(types.InlineKeyboardButton("رجوع", callback_data="adm:main"))
+    bot.edit_message_text(text, chat_id, msg_id, reply_markup=kb)
+
+
+def show_blocked_list(chat_id, msg_id):
+    total = db.count_blocked()
+    rows = db.list_blocked(limit=15)
+    text = f"عدد من حظر البوت: {total}\n\n"
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    if not rows:
+        text += "لا يوجد سجل حاليًا بمستخدمين حظروا البوت."
+    else:
+        text += "آخر من حظر البوت (حتى 15):\n"
+        for uid, username, first_name, blocked_at in rows:
+            label = f"@{username}" if username else (first_name or str(uid))
+            kb.add(types.InlineKeyboardButton(
+                f"إزالة {label} من القائمة", callback_data=f"adm:unblock:{uid}"
+            ))
+    text += (
+        "\n\nيتم اكتشاف هؤلاء تلقائيًا أثناء الإذاعة (عند فشل الإرسال بسبب "
+        "الحظر)، ويُستثنون من الإذاعات القادمة لتسريعها وتوفير الطلبات. "
+        "أي مستخدم يعود لاستخدام البوت تُزال عنه هذه العلامة تلقائيًا."
+    )
     kb.add(types.InlineKeyboardButton("رجوع", callback_data="adm:main"))
     bot.edit_message_text(text, chat_id, msg_id, reply_markup=kb)
 
@@ -1737,7 +1870,7 @@ def show_admin_appearance(chat_id, msg_id):
     text = (
         "إعدادات الحقوق والنتيجة:\n\n"
         f"الحجم الافتراضي للحقوق: {size}%\n"
-        f"حذف النتيجة تلقائيًا بعد: {delete_text}"
+        f"حذف نتيجة الصورة تلقائيًا بعد: {delete_text}"
     )
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(types.InlineKeyboardButton("تغيير حجم الحقوق", callback_data="adm:appearance:fsize"))
@@ -1747,6 +1880,7 @@ def show_admin_appearance(chat_id, msg_id):
         types.InlineKeyboardButton("30 ثانية", callback_data="adm:delete:30"),
         types.InlineKeyboardButton("60 ثانية", callback_data="adm:delete:60"),
     )
+    kb.add(types.InlineKeyboardButton("مدة مخصصة", callback_data="adm:delete:custom"))
     kb.add(types.InlineKeyboardButton("تعطيل الحذف", callback_data="adm:delete:0"))
     kb.add(types.InlineKeyboardButton("رجوع", callback_data="adm:main"))
     bot.edit_message_text(text, chat_id, msg_id, reply_markup=kb)
@@ -1780,19 +1914,36 @@ def process_admin_text_input(message, state):
                 bot.reply_to(message, "الرسالة فارغة.")
                 return
             sessions.set_admin_state(user_id, None)
-            ids = db.all_user_ids()
+            # نستثني من سبق واكتُشف أنه حظر البوت لتسريع الإذاعة وتقليل
+            # الطلبات المهدورة، وهو أمر مهم على استضافة Railway المجانية.
+            ids = db.broadcastable_user_ids()
+            total_targets = len(ids)
             sent_count = 0
+            blocked_count = 0
             failed_count = 0
-            status = bot.reply_to(message, f"بدأت الإذاعة إلى {len(ids)} مستخدم.")
+            status = bot.reply_to(
+                message,
+                f"بدأت الإذاعة إلى {total_targets} مستخدم "
+                f"(تم استثناء من سبق أن حظر البوت)."
+            )
             for target_id in ids:
                 try:
                     bot.send_message(target_id, text)
                     sent_count += 1
-                    time.sleep(0.04)
+                except ApiTelegramException as api_err:
+                    if api_err.error_code == 403:
+                        db.mark_blocked(target_id)
+                        blocked_count += 1
+                    else:
+                        failed_count += 1
                 except Exception:
                     failed_count += 1
+                time.sleep(0.04)
             bot.edit_message_text(
-                f"انتهت الإذاعة.\n\nتم الإرسال: {sent_count}\nفشل الإرسال: {failed_count}",
+                "انتهت الإذاعة.\n\n"
+                f"تم الإرسال: {sent_count}\n"
+                f"حظروا البوت (تم تحديث القائمة): {blocked_count}\n"
+                f"فشل لأسباب أخرى: {failed_count}",
                 message.chat.id, status.message_id, reply_markup=admin_main_keyboard()
             )
 
@@ -1817,6 +1968,19 @@ def process_admin_text_input(message, state):
             db.set_setting("force_channel_username", parts[1].lstrip("@"))
             sessions.set_admin_state(user_id, None)
             bot.reply_to(message, "تم تحديث بيانات القناة بنجاح.", reply_markup=admin_main_keyboard())
+
+        elif state == "awaiting_delete_seconds":
+            if not text.isdigit():
+                bot.reply_to(message, "الرجاء إرسال رقم صحيح (0 أو أكثر).")
+                return
+            seconds = int(text)
+            if seconds < 0 or seconds > 3600:
+                bot.reply_to(message, "الرقم يجب أن يكون بين 0 و 3600 ثانية.")
+                return
+            db.set_setting("delete_result_after_seconds", seconds)
+            sessions.set_admin_state(user_id, None)
+            label = f"{seconds} ثانية" if seconds > 0 else "معطّل"
+            bot.reply_to(message, f"تم حفظ مدة حذف الصور: {label}.", reply_markup=admin_main_keyboard())
     except Exception as e:
         log.warning("admin text input error: %s", e)
 
@@ -1865,9 +2029,4 @@ def main():
         try:
             bot.infinity_polling(timeout=20, long_polling_timeout=20, skip_pending=True)
         except Exception as e:
-            log.warning("polling crashed, restarting in 5 seconds: %s", e)
-            time.sleep(5)
-
-
-if __name__ == "__main__":
-    main()
+            log.warning("polling 
