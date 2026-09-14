@@ -1203,14 +1203,30 @@ def handle_photo(message):
             pass
 
 
+@bot.message_handler(commands=["admin"])
+def handle_admin_command(message):
+    """فتح لوحة التحكم للمالك فقط."""
+    try:
+        if message.from_user.id != OWNER_ID:
+            bot.reply_to(message, "هذا الأمر مخصص لمالك البوت فقط.")
+            return
+        db.touch_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+        sessions.set_admin_state(message.from_user.id, None)
+        bot.send_message(message.chat.id, "لوحة تحكم المالك", reply_markup=admin_main_keyboard())
+    except Exception as e:
+        log.warning("admin command error: %s", e)
+        try: bot.reply_to(message, "تعذر فتح لوحة التحكم، حاول مرة أخرى.")
+        except Exception: pass
+
+
 @bot.message_handler(content_types=["text"])
 def handle_text(message):
     user_id = message.from_user.id
     text = message.text.strip()
 
-    # أوامر عامة
+    # أمر /admin تتم معالجته بواسطة المعالج المخصص أعلاه.
     if text == "/admin":
-        return handle_admin_entry(message)
+        return handle_admin_command(message)
 
     # حالة إدخال إعدادات المستخدم
     state = sessions.get_admin_state(user_id)
